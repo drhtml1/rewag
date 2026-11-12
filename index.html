@@ -148,6 +148,7 @@
     .auth-card > p { margin: 0 0 30px; color: var(--muted); line-height: 1.7; }
     .auth-form { display: grid; gap: 17px; }
     .auth-form .primary-btn { margin-top: 6px; padding: 13px; }
+    .auth-forgot { justify-self: start; margin-top: -10px; }
     .auth-switch { text-align: center; margin-top: 23px; color: var(--muted); font-size: 14px; }
     .text-btn { border: 0; background: transparent; color: var(--purple); font-weight: 700; padding: 4px; }
     .demo-hint { margin-top: 24px; padding: 12px 14px; border-radius: 11px; background: #f8f7ff; color: #77718d; font-size: 12px; line-height: 1.7; }
@@ -502,7 +503,7 @@
             <label for="workspace-code-input">رمز مساحة العمل (اختياري)</label>
             <input id="workspace-code-input" type="text" autocomplete="off" placeholder="الصق رمز الدعوة الذي أرسله لك المشرف">
           </div>
-          <div class="field">
+          <div id="email-field" class="field">
             <label for="email-input">البريد الإلكتروني</label>
             <input id="email-input" type="email" autocomplete="email" placeholder="name@company.com" required>
           </div>
@@ -510,6 +511,11 @@
             <label for="password-input">كلمة المرور</label>
             <input id="password-input" type="password" autocomplete="current-password" placeholder="٦ أحرف على الأقل" minlength="6" required>
           </div>
+          <div id="password-confirm-field" class="field hidden">
+            <label for="password-confirm-input">تأكيد كلمة المرور الجديدة</label>
+            <input id="password-confirm-input" type="password" autocomplete="new-password" placeholder="أعد كتابة كلمة المرور" minlength="6">
+          </div>
+          <button id="forgot-password" class="text-btn auth-forgot" type="button">نسيت كلمة المرور؟</button>
           <button id="auth-submit" class="primary-btn" type="submit">دخول إلى مساحة العمل <span aria-hidden="true">←</span></button>
         </form>
         <div class="auth-switch"><span id="auth-switch-copy">مستخدم جديد؟</span> <button id="auth-switch" class="text-btn" type="button">أنشئ حساباً</button></div>
@@ -698,6 +704,7 @@
     let data = { rooms: [], workspaceName: "مساحة فريقي", settings: { theme: "light", notifications: true } };
     let currentRoomId = null;
     let authMode = "login";
+    let recoveryLink = new URLSearchParams(window.location.hash.slice(1)).get("type") === "recovery";
     let microphone = null;
     let voiceJoined = false;
     let toastTimer;
@@ -856,10 +863,14 @@
         showAuth();
         return;
       }
+      if (recoveryLink) {
+        setAuthMode("reset");
+        showAuth();
+      }
       try {
         const { data: sessionData, error } = await dbClient.auth.getSession();
         if (error) throw error;
-        if (sessionData.session) await activateUser(sessionData.session.user);
+        if (sessionData.session && !recoveryLink) await activateUser(sessionData.session.user);
         else showAuth();
       } catch (error) {
         console.error("تعذر استعادة جلسة الدخول أو تحميل مساحة العمل:", error);
@@ -867,6 +878,11 @@
         showToast("تعذر الاتصال بقاعدة البيانات. تحقق من إعداد المشروع والاتصال.", true);
       }
       dbClient.auth.onAuthStateChange(event => {
+        if (event === "PASSWORD_RECOVERY") {
+          recoveryLink = true;
+          setAuthMode("reset");
+          showAuth();
+        }
         if (event === "SIGNED_OUT") {
           currentUser = null;
           activeWorkspaceId = null;
@@ -1360,13 +1376,30 @@
       }
       const email = document.getElementById("email-input").value.trim().toLowerCase();
       const password = document.getElementById("password-input").value;
-      if (!email || password.length < 6) return;
+      const passwordConfirmation = document.getElementById("password-confirm-input").value;
+      if ((authMode === "forgot" && !email) || (authMode !== "forgot" && authMode !== "reset" && (!email || password.length < 6))) return;
+      if (authMode === "reset" && (password.length < 6 || password !== passwordConfirmation)) {
+        showToast(password !== passwordConfirmation ? "كلمتا المرور غير متطابقتين." : "يجب أن تتكون كلمة المرور من ٦ أحرف على الأقل.", true);
+        return;
+      }
       const name = document.getElementById("name-input").value.trim();
       const workspaceCode = document.getElementById("workspace-code-input").value.trim();
       const submit = document.getElementById("auth-submit");
       submit.disabled = true;
       try {
-        if (authMode === "signup") {
+        if (authMode === "forgot") {
+          const { error } = await dbClient.auth.resetPasswordForEmail(email, {
+            redirectTo: window.location.origin + window.location.pathname
+          });
+          if (error) throw error;
+          showToast("أرسلنا رابط إعادة تعيين كلمة المرور إلى بريدك الإلكتروني.");
+        } else if (authMode === "reset") {
+          const { data: updateData, error } = await dbClient.auth.updateUser({ password });
+          if (error) throw error;
+          recoveryLink = false;
+          await activateUser(updateData.user);
+          showToast("تم تحديث كلمة المرور بنجاح.");
+        } else if (authMode === "signup") {
           const { data: signupData, error } = await dbClient.auth.signUp({
             email,
             password,
@@ -1391,18 +1424,51 @@
       }
     });
 
-    document.getElementById("auth-switch").addEventListener("click", () => {
-      authMode = authMode === "login" ? "signup" : "login";
-      const signup = authMode === "signup";
-      document.getElementById("auth-title").textContent = signup ? "ابدأوا مساحة فريقكم" : "أهلاً بعودتك";
-      document.getElementById("auth-description").textContent = signup ? "أنشئ حسابك وابدأ بتنظيم شغل فريقك." : "سجّل دخولك وتابع شغل فريقك من مكان واحد.";
+    function setAuthMode(mode) {
+      authMode = mode;
+      const signup = mode === "signup";
+      const forgot = mode === "forgot";
+      const reset = mode === "reset";
+      document.getElementById("auth-title").textContent = signup ? "ابدأوا مساحة فريقكم" : forgot ? "استعادة كلمة المرور" : reset ? "اختر كلمة مرور جديدة" : "أهلاً بعودتك";
+      document.getElementById("auth-description").textContent = signup
+        ? "أنشئ حسابك وابدأ بتنظيم شغل فريقك."
+        : forgot
+          ? "أدخل بريدك الإلكتروني وسنرسل لك رابطاً لإعادة تعيين كلمة المرور."
+          : reset
+            ? "اكتب كلمة مرور جديدة لحسابك."
+            : "سجّل دخولك وتابع شغل فريقك من مكان واحد.";
       document.getElementById("name-field").classList.toggle("hidden", !signup);
       document.getElementById("workspace-code-field").classList.toggle("hidden", !signup);
+      document.getElementById("email-field").classList.toggle("hidden", reset);
+      document.getElementById("password-input").parentElement.classList.toggle("hidden", forgot);
+      document.getElementById("password-confirm-field").classList.toggle("hidden", !reset);
+      document.getElementById("forgot-password").classList.toggle("hidden", mode !== "login");
       document.getElementById("name-input").required = signup;
-      document.getElementById("auth-submit").innerHTML = signup ? "إنشاء حساب ←" : "دخول إلى مساحة العمل ←";
-      document.getElementById("auth-switch-copy").textContent = signup ? "عندك حساب بالفعل؟" : "مستخدم جديد؟";
-      document.getElementById("auth-switch").textContent = signup ? "سجّل دخولك" : "أنشئ حساباً";
-      document.getElementById("password-input").autocomplete = signup ? "new-password" : "current-password";
+      document.getElementById("email-input").required = !reset;
+      document.getElementById("password-input").required = !forgot;
+      document.getElementById("password-confirm-input").required = reset;
+      document.getElementById("password-input").autocomplete = signup || reset ? "new-password" : "current-password";
+      document.getElementById("auth-submit").textContent = signup
+        ? "إنشاء حساب ←"
+        : forgot
+          ? "إرسال رابط الاستعادة"
+          : reset
+            ? "حفظ كلمة المرور"
+            : "دخول إلى مساحة العمل ←";
+      document.getElementById("auth-switch-copy").textContent = signup ? "عندك حساب بالفعل؟" : forgot ? "" : "مستخدم جديد؟";
+      document.getElementById("auth-switch").textContent = signup ? "سجّل دخولك" : forgot || reset ? "العودة لتسجيل الدخول" : "أنشئ حساباً";
+      document.querySelector(".auth-switch").classList.toggle("hidden", reset);
+    }
+
+    document.getElementById("forgot-password").addEventListener("click", () => setAuthMode("forgot"));
+
+    document.getElementById("auth-switch").addEventListener("click", () => {
+      if (authMode === "forgot" || authMode === "reset") {
+        recoveryLink = false;
+        setAuthMode("login");
+      } else {
+        setAuthMode(authMode === "login" ? "signup" : "login");
+      }
     });
 
     document.getElementById("logout-btn").addEventListener("click", async () => {
